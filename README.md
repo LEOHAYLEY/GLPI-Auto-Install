@@ -35,4 +35,6 @@ Permissões corretas em diretórios sensíveis
 Redis configurado localmente
 
 rode:
-wget https://raw.githubusercontent.com/LEOHAYLEY/GLPI-Auto-Installer-/main/install_glpi.sh && bash install_glpi.sh
+ wget https://raw.githubusercontent.com/LEOHAYLEY/GLPI-Auto-Installer-/main/install_glpi.sh -O install.sh
+chmod +x install.sh
+./install.sh
