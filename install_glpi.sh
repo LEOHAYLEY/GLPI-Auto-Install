@@ -3,7 +3,7 @@
 set -e
 
 echo "=========================================="
-echo "     INSTALADOR AUTOMATICO GLPI v4"
+echo "      INSTALADOR AUTOMATICO GLPI"
 echo "=========================================="
 
 # Detectar sistema
@@ -11,12 +11,10 @@ if [ -f /etc/debian_version ]; then
     OS="debian"
     WEB_USER="www-data"
     APACHE="apache2"
-    PHP="php"
 elif [ -f /etc/redhat-release ]; then
     OS="redhat"
     WEB_USER="apache"
     APACHE="httpd"
-    PHP="php"
 else
     echo "Sistema nao suportado."
     exit 1
@@ -24,14 +22,13 @@ fi
 
 echo "Sistema detectado: $OS"
 
-# Variáveis banco
 DB_NAME="glpidb"
 DB_USER="glpiuser"
 DB_PASS=$(openssl rand -base64 18 | tr -dc 'a-zA-Z0-9' | head -c 16)
 
-echo "Senha gerada para banco: $DB_PASS"
+echo "Senha do banco gerada: $DB_PASS"
 
-echo "Atualizando sistema..."
+echo "Instalando dependencias..."
 
 if [ "$OS" = "debian" ]; then
     apt update -y
@@ -40,6 +37,7 @@ if [ "$OS" = "debian" ]; then
 
     systemctl enable apache2 mariadb redis-server
     systemctl restart apache2 mariadb redis-server
+
 else
     dnf install -y epel-release
     dnf install -y httpd mariadb-server redis curl wget unzip \
@@ -55,7 +53,7 @@ mysql -u root <<EOF
 DROP DATABASE IF EXISTS $DB_NAME;
 DROP USER IF EXISTS '$DB_USER'@'localhost';
 CREATE DATABASE $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER '$DB_USER'@'localhost' IDENTIFIED WITH mysql_native_password BY '$DB_PASS';
+CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
 GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 EOF
@@ -77,37 +75,30 @@ tar -xzf /tmp/glpi.tgz -C /var/www/
 chown -R $WEB_USER:$WEB_USER /var/www/glpi
 chmod -R 755 /var/www/glpi
 
-echo "GLPI extraido."
+echo "Instalando GLPI via CLI..."
 
-echo "Instalando banco no GLPI..."
-
-sudo -u $WEB_USER $PHP /var/www/glpi/bin/console db:install \
+sudo -u $WEB_USER php /var/www/glpi/bin/console db:install \
 --db-host=localhost \
 --db-name=$DB_NAME \
 --db-user=$DB_USER \
 --db-password=$DB_PASS \
 --no-interaction
 
-echo "Banco inicializado no GLPI."
+echo "Configurando Redis no GLPI..."
 
-echo "Configurando Redis..."
+sudo -u $WEB_USER php /var/www/glpi/bin/console config:set cache_handler redis
+sudo -u $WEB_USER php /var/www/glpi/bin/console config:set redis_host 127.0.0.1
 
-sudo -u $WEB_USER $PHP /var/www/glpi/bin/console config:set cache_handler redis
-sudo -u $WEB_USER $PHP /var/www/glpi/bin/console config:set redis_host 127.0.0.1
+echo "Configurando CRON..."
 
-echo "Redis configurado."
-
-echo "Configurando cron..."
-
-echo "*/5 * * * * $WEB_USER $PHP /var/www/glpi/bin/console glpi:cron >> /var/www/glpi/files/_log/cron.log 2>&1" > /etc/cron.d/glpi
-
+echo "*/5 * * * * $WEB_USER php /var/www/glpi/bin/console glpi:cron >> /var/www/glpi/files/_log/cron.log 2>&1" > /etc/cron.d/glpi
 chmod 644 /etc/cron.d/glpi
 
 IP=$(hostname -I | awk '{print $1}')
 
 echo ""
 echo "=========================================="
-echo "        GLPI INSTALADO COM SUCESSO"
+echo "      GLPI INSTALADO COM SUCESSO"
 echo "=========================================="
 echo "Acesse: http://$IP/glpi"
 echo ""
