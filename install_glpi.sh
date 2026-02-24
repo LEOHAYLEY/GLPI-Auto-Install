@@ -7,7 +7,7 @@ LOG="/var/log/glpi_install.log"
 exec > >(tee -a "$LOG") 2>&1
 
 echo "=============================================="
-echo "  INSTALL_GLPI_FINAL - Instalador GLPI (vFINAL)"
+echo "  Instalador GLPI"
 echo "=============================================="
 
 if [ "$EUID" -ne 0 ]; then
@@ -19,32 +19,32 @@ fi
 if [ -f /etc/debian_version ]; then
   OS="debian"
   WEB_USER="www-data"
+  APACHE_SERVICE="apache2"
+  REDIS_SERVICE="redis-server"
   PKG_UPDATE_CMD=("apt" "update")
   PKG_UPGRADE_CMD=("apt" "upgrade" "-y")
   PKG_INSTALL_CMD=("apt" "install" "-y")
-  APACHE_SERVICE="apache2"
-  REDIS_SERVICE="redis-server"
 elif [ -f /etc/redhat-release ]; then
   OS="rhel"
   WEB_USER="apache"
-  # choose dnf if available, fallback to yum
+  # prefer dnf if available
   if command -v dnf >/dev/null 2>&1; then
     PM="dnf"
   else
     PM="yum"
   fi
-  PKG_UPDATE_CMD=("$PM" "-y" "upgrade")
-  PKG_UPGRADE_CMD=("$PM" "-y" "upgrade")
-  PKG_INSTALL_CMD=("$PM" "install" "-y")
   APACHE_SERVICE="httpd"
   REDIS_SERVICE="redis"
+  PKG_UPDATE_CMD=("$PM" "-y" "update")
+  PKG_UPGRADE_CMD=("$PM" "-y" "upgrade")
+  PKG_INSTALL_CMD=("$PM" "install" "-y")
 else
   echo "Sistema não suportado por este instalador." >&2
   exit 1
 fi
 
 echo "Sistema detectado: $OS"
-echo "Log em: $LOG"
+echo "Log: $LOG"
 
 # Variables
 DB_NAME="glpidb"
@@ -57,28 +57,27 @@ CRED_FILE="/root/glpi_db_credentials.txt"
 echo "Senha gerada para DB: $DB_PASS"
 
 # Helper to run package manager commands (array)
-run_cmd() {
-  "$@"
-}
+run_cmd() { "$@"; }
 
 # 1) Update & install packages
 echo "Atualizando pacotes..."
 run_cmd "${PKG_UPDATE_CMD[@]}"
 
-# For Debian, ensure apt-get upgrade to apply security fixes
+# For Debian, apply upgrade
 if [ "$OS" = "debian" ]; then
   run_cmd "${PKG_UPGRADE_CMD[@]}"
 fi
 
 echo "Instalando pacotes necessários..."
 if [ "$OS" = "debian" ]; then
+  # Debian/Ubuntu packages
   run_cmd "${PKG_INSTALL_CMD[@]}" apache2 mariadb-server "$REDIS_SERVICE" curl wget unzip tar \
     php php-cli php-common php-mysql php-xml php-mbstring php-curl php-gd php-intl php-zip php-bz2 php-ldap php-apcu php-redis
 else
-  # RHEL-based
+  # RHEL-based packages
   run_cmd "${PKG_INSTALL_CMD[@]}" epel-release || true
   run_cmd "${PKG_INSTALL_CMD[@]}" "$APACHE_SERVICE" mariadb-server "$REDIS_SERVICE" curl wget unzip tar \
-    php php-cli php-common php-mysqlnd php-xml php-mbstring php-curl php-gd php-intl php-zip php-bz2 php-ldap php-pecl-apcu php-pecl-redis
+    php php-cli php-common php-mysqlnd php-xml php-mbstring php-curl php-gd php-intl php-zip php-bz2 php-ldap php-pecl-apcu php-pecl-redis || true
 fi
 
 # Enable & start services
@@ -135,10 +134,10 @@ rm -rf "$GLPI_DIR"
 mkdir -p /var/www
 tar -xzf "$TMP_TGZ" -C /var/www/ || { echo "Erro ao extrair arquivo"; exit 1; }
 
+# If tar extracted into glpi or glpi-x.y.z
 if [ -d /var/www/glpi ]; then
   true
 else
-  # move first glpi-* dir to glpi
   FIRST=$(ls -1 /var/www | grep -E '^glpi' | head -n1 || true)
   if [ -n "$FIRST" ]; then
     mv "/var/www/$FIRST" /var/www/glpi
@@ -150,12 +149,12 @@ fi
 
 # 6) Permissions (as GLPI docs)
 echo "Ajustando permissões..."
-chown -R "$WEB_USER":"$WEB_USER" "$GLPI_DIR"
+chown -R "${WEB_USER}:${WEB_USER}" "$GLPI_DIR"
 find "$GLPI_DIR" -type d -exec chmod 755 {} \;
 find "$GLPI_DIR" -type f -exec chmod 644 {} \;
 for d in files config files/_log; do
   mkdir -p "$GLPI_DIR/$d"
-  chown -R "$WEB_USER":"$WEB_USER" "$GLPI_DIR/$d"
+  chown -R "${WEB_USER}:${WEB_USER}" "$GLPI_DIR/$d"
   chmod -R 775 "$GLPI_DIR/$d"
 done
 
@@ -177,7 +176,9 @@ systemctl reload "$APACHE_SERVICE" 2>/dev/null || true
 echo "Configurando VirtualHost Apache..."
 HOSTNAME_FQDN=$(hostname -f 2>/dev/null || hostname)
 if [ "$OS" = "debian" ]; then
-  cat > /etc/apache2/sites-available/glpi.conf <<APACHE
+  # create site file (idempotent)
+  if [ ! -f /etc/apache2/sites-available/glpi.conf ]; then
+    cat > /etc/apache2/sites-available/glpi.conf <<APACHE
 <VirtualHost *:80>
     ServerName ${HOSTNAME_FQDN}
     DocumentRoot ${GLPI_DIR}/public
@@ -189,12 +190,16 @@ if [ "$OS" = "debian" ]; then
     CustomLog \${APACHE_LOG_DIR}/glpi_access.log combined
 </VirtualHost>
 APACHE
+  fi
+
+  # enable rewrite and site
   a2enmod rewrite || true
-  a2dissite 000-default.conf || true
   a2ensite glpi.conf || true
+  a2dissite 000-default.conf || true
   systemctl reload apache2 || true
 else
-  cat > /etc/httpd/conf.d/glpi.conf <<APACHE
+  if [ ! -f /etc/httpd/conf.d/glpi.conf ]; then
+    cat > /etc/httpd/conf.d/glpi.conf <<APACHE
 <VirtualHost *:80>
     ServerName ${HOSTNAME_FQDN}
     DocumentRoot ${GLPI_DIR}/public
@@ -206,6 +211,7 @@ else
     CustomLog /var/log/httpd/glpi_access.log combined
 </VirtualHost>
 APACHE
+  fi
   systemctl reload httpd || true
 fi
 
@@ -229,7 +235,7 @@ if [ $RC -ne 0 ]; then
     --db-user="${DB_USER}" \
     --db-password="${DB_PASS}" \
     --allow-superuser \
-    --no-interaction
+    --no-interaction || true
 fi
 
 # 10) Configure Redis (local_define.php + console fallback)
@@ -242,7 +248,7 @@ define('GLPI_REDIS_HOST', '127.0.0.1');
 define('GLPI_REDIS_PORT', 6379);
 define('GLPI_REDIS_DB', 0);
 PHPDEF
-chown "$WEB_USER":"$WEB_USER" "$LOCAL_DEFINE"
+chown "${WEB_USER}:${WEB_USER}" "$LOCAL_DEFINE"
 chmod 644 "$LOCAL_DEFINE"
 
 # Try console config as well
