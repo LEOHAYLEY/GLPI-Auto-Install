@@ -158,6 +158,19 @@ for d in files config files/_log; do
   chmod -R 775 "$GLPI_DIR/$d"
 done
 
+# --- AJUSTE .HTACCESS PARA GLPI 10 ---
+echo "Criando .htaccess na pasta public..."
+cat > "${GLPI_DIR}/public/.htaccess" <<HTACCESS
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(.*)$ index.php [QSA,L]
+</IfModule>
+HTACCESS
+chown "${WEB_USER}:${WEB_USER}" "${GLPI_DIR}/public/.htaccess"
+# ------------------------------------
+
 # 7) PHP tweaks (php.ini)
 echo "Ajustando php.ini (parâmetros mínimos)..."
 PHP_INI_PATH=$(php --ini | awk -F': ' '/Loaded Configuration/{print $2}')
