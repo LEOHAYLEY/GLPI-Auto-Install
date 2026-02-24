@@ -1,163 +1,113 @@
 #!/bin/bash
 
-echo "=============================================="
-echo "        GLPI Automatic Installer"
-echo "=============================================="
+set -e
 
-if [ "$EUID" -ne 0 ]; then
-  echo "Execute como root."
-  exit 1
-fi
+echo "==== INSTALADOR AUTOMATICO GLPI ===="
 
-### Detect OS
+# Detectar sistema
 if [ -f /etc/debian_version ]; then
     OS="debian"
+    WEB_USER="www-data"
+    PHP="php"
     APACHE="apache2"
-    APACHE_USER="www-data"
-    PKG_UPDATE="apt update -y"
-    PKG_INSTALL="apt install -y"
 elif [ -f /etc/redhat-release ]; then
-    OS="rhel"
+    OS="redhat"
+    WEB_USER="apache"
+    PHP="php"
     APACHE="httpd"
-    APACHE_USER="apache"
-    PKG_UPDATE="dnf update -y"
-    PKG_INSTALL="dnf install -y"
 else
-    echo "Sistema não suportado."
+    echo "Sistema nao suportado."
     exit 1
 fi
 
 echo "Sistema detectado: $OS"
-sleep 2
 
-### Update system
-eval $PKG_UPDATE
-
-### Install dependencies
-if [ "$OS" = "debian" ]; then
-    eval $PKG_INSTALL curl wget unzip tar apache2 mariadb-server redis-server \
-    php php-cli php-common php-mysql php-gd php-intl php-mbstring php-bcmath php-xml php-curl php-zip php-ldap
-else
-    eval $PKG_INSTALL curl wget unzip tar httpd mariadb-server redis \
-    php php-cli php-common php-mysqlnd php-gd php-intl php-mbstring php-bcmath php-xml php-curl php-zip php-ldap
-fi
-
-systemctl enable mariadb --now
-systemctl enable $APACHE --now
-
-if [ "$OS" = "debian" ]; then
-    systemctl enable redis-server --now
-else
-    systemctl enable redis --now
-fi
-
-### Generate DB credentials
+# Gerar senha forte
 DB_NAME="glpidb"
 DB_USER="glpiuser"
-DB_PASS=$(openssl rand -base64 16 | tr -dc A-Za-z0-9 | head -c16)
+DB_PASS=$(openssl rand -base64 16)
 
-echo "Criando banco de dados..."
+echo "Senha gerada para banco: $DB_PASS"
 
+# Atualizar sistema
+if [ "$OS" = "debian" ]; then
+    apt update -y
+    apt install -y apache2 mariadb-server redis-server curl wget unzip \
+    php php-{mysql,xml,mbstring,curl,gd,intl,zip,bz2,ldap,apcu,redis,cli}
+
+    systemctl enable apache2 mariadb redis-server
+    systemctl start apache2 mariadb redis-server
+
+else
+    dnf install -y epel-release
+    dnf install -y httpd mariadb-server redis curl wget unzip \
+    php php-{mysqlnd,xml,mbstring,curl,gd,intl,zip,bz2,ldap,opcache,redis,cli}
+
+    systemctl enable httpd mariadb redis
+    systemctl start httpd mariadb redis
+fi
+
+# Criar banco
 mysql -u root <<EOF
-CREATE DATABASE $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+CREATE DATABASE IF NOT EXISTS $DB_NAME CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
 GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost';
 FLUSH PRIVILEGES;
 EOF
 
-### Get latest GLPI
-echo "Obtendo última versão do GLPI..."
+echo "Banco configurado."
+
+# Baixar última versão GLPI
 GLPI_URL=$(curl -s https://api.github.com/repos/glpi-project/glpi/releases/latest \
 | grep browser_download_url \
 | grep ".tgz" \
 | cut -d '"' -f 4)
 
-if [ -z "$GLPI_URL" ]; then
-    echo "Erro ao obter URL do GLPI"
-    exit 1
-fi
-
 wget -O /tmp/glpi.tgz $GLPI_URL
-tar -xzf /tmp/glpi.tgz -C /var/www/
 
-chown -R $APACHE_USER:$APACHE_USER /var/www/glpi
+rm -rf /var/www/glpi
+tar -xzf /tmp/glpi.tgz -C /var/www/
+chown -R $WEB_USER:$WEB_USER /var/www/glpi
 chmod -R 755 /var/www/glpi
 
-### Apache Config
-if [ "$OS" = "debian" ]; then
-cat > /etc/apache2/sites-available/glpi.conf <<EOF
-<VirtualHost *:80>
-    DocumentRoot /var/www/glpi/public
-    <Directory /var/www/glpi/public>
-        Require all granted
-        AllowOverride All
-    </Directory>
-</VirtualHost>
-EOF
+echo "GLPI instalado em /var/www/glpi"
 
-a2enmod rewrite
-a2ensite glpi.conf
-systemctl reload apache2
-else
-cat > /etc/httpd/conf.d/glpi.conf <<EOF
-<VirtualHost *:80>
-    DocumentRoot /var/www/glpi/public
-    <Directory /var/www/glpi/public>
-        Require all granted
-        AllowOverride All
-    </Directory>
-</VirtualHost>
-EOF
-
-systemctl reload httpd
-fi
-
-### Configure Redis in GLPI
-echo "Configurando Redis..."
-
-cat > /var/www/glpi/config/local_define.php <<EOF
-<?php
-define('GLPI_CACHE_REDIS_SERVER', '127.0.0.1');
-define('GLPI_CACHE_REDIS_PORT', 6379);
-define('GLPI_CACHE_REDIS_DATABASE', 0);
-EOF
-
-chown $APACHE_USER:$APACHE_USER /var/www/glpi/config/local_define.php
-
-### Setup GLPI CLI install
-echo "Instalando GLPI via CLI..."
-
-php /var/www/glpi/bin/console db:install \
+# Instalar banco via CLI como usuário web
+sudo -u $WEB_USER $PHP /var/www/glpi/bin/console db:install \
 --db-host=localhost \
 --db-name=$DB_NAME \
 --db-user=$DB_USER \
 --db-password=$DB_PASS \
 --no-interaction
 
-### Setup Cron
-echo "Configurando cron..."
+echo "Banco inicializado no GLPI."
 
-cat > /etc/systemd/system/glpi-cron.service <<EOF
-[Unit]
-Description=GLPI Cron
-After=network.target
+# Configurar Redis no GLPI
+sudo -u $WEB_USER $PHP /var/www/glpi/bin/console config:set cache_handler redis
+sudo -u $WEB_USER $PHP /var/www/glpi/bin/console config:set redis_host 127.0.0.1
 
-[Service]
-User=$APACHE_USER
-ExecStart=/usr/bin/php /var/www/glpi/bin/console glpi:cron
+echo "Redis configurado."
 
-[Install]
-WantedBy=multi-user.target
-EOF
+# Configurar cron
+CRON_CMD="*/5 * * * * $WEB_USER $PHP /var/www/glpi/bin/console glpi:cron >> /var/www/glpi/files/_log/cron.log 2>&1"
 
-systemctl daemon-reload
-systemctl enable glpi-cron --now
+if [ "$OS" = "debian" ]; then
+    echo "$CRON_CMD" > /etc/cron.d/glpi
+else
+    echo "$CRON_CMD" > /etc/cron.d/glpi
+fi
 
-echo "=============================================="
-echo "Instalação concluída com sucesso!"
+echo "Cron configurado."
+
+IP=$(hostname -I | awk '{print $1}')
+
 echo ""
-echo "URL: http://SEU_IP"
-echo "Banco: $DB_NAME"
-echo "Usuário DB: $DB_USER"
-echo "Senha DB: $DB_PASS"
-echo "=============================================="
+echo "========================================"
+echo "GLPI INSTALADO COM SUCESSO"
+echo "Acesse: http://$IP/glpi"
+echo ""
+echo "Banco:"
+echo "Nome: $DB_NAME"
+echo "Usuario: $DB_USER"
+echo "Senha: $DB_PASS"
+echo "========================================"
