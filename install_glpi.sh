@@ -2,78 +2,93 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# INSTALL_GLPI_FINAL.sh - Instalador automático GLPI (Debian/Ubuntu | RHEL/Rocky)
-# Segue recomendações oficiais do GLPI (downstream/local_define, php.ini, timezone, permissões).
-# Referência: GLPI Install Tutorial. :contentReference[oaicite:3]{index=3}
-
+# install_glpi_final.sh - instalador automático GLPI (Debian/Ubuntu | RHEL/Rocky)
 LOG="/var/log/glpi_install.log"
 exec > >(tee -a "$LOG") 2>&1
 
-echo "=========================================="
-echo "  INSTALL_GLPI_FINAL - Instalador GLPI v1"
-echo "=========================================="
+echo "=============================================="
+echo "  INSTALL_GLPI_FINAL - Instalador GLPI (vFINAL)"
+echo "=============================================="
 
 if [ "$EUID" -ne 0 ]; then
-  echo "Execute como root."
+  echo "Execute como root (sudo)." >&2
   exit 1
 fi
 
-# Detect OS
+# Detect OS and package manager specifics
 if [ -f /etc/debian_version ]; then
   OS="debian"
   WEB_USER="www-data"
-  PKG_UPDATE="apt update -y"
-  PKG_INSTALL="apt install -y"
-  PHP_PKG_PREFIX="php"
+  PKG_UPDATE_CMD=("apt" "update")
+  PKG_UPGRADE_CMD=("apt" "upgrade" "-y")
+  PKG_INSTALL_CMD=("apt" "install" "-y")
+  APACHE_SERVICE="apache2"
+  REDIS_SERVICE="redis-server"
 elif [ -f /etc/redhat-release ]; then
   OS="rhel"
   WEB_USER="apache"
-  PKG_UPDATE="dnf -y update"
-  PKG_INSTALL="dnf install -y"
-  PHP_PKG_PREFIX="php"
+  # choose dnf if available, fallback to yum
+  if command -v dnf >/dev/null 2>&1; then
+    PM="dnf"
+  else
+    PM="yum"
+  fi
+  PKG_UPDATE_CMD=("$PM" "-y" "upgrade")
+  PKG_UPGRADE_CMD=("$PM" "-y" "upgrade")
+  PKG_INSTALL_CMD=("$PM" "install" "-y")
+  APACHE_SERVICE="httpd"
+  REDIS_SERVICE="redis"
 else
-  echo "Sistema não suportado."
+  echo "Sistema não suportado por este instalador." >&2
   exit 1
 fi
 
 echo "Sistema detectado: $OS"
-echo "Log: $LOG"
+echo "Log em: $LOG"
 
 # Variables
 DB_NAME="glpidb"
 DB_USER="glpiuser"
-DB_PASS=$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)
-GLPI_INSTALL_DIR="/var/www/glpi"
+DB_PASS="$(openssl rand -base64 18 | tr -dc 'A-Za-z0-9' | head -c 16)"
+GLPI_DIR="/var/www/glpi"
 TMP_TGZ="/tmp/glpi.tgz"
+CRED_FILE="/root/glpi_db_credentials.txt"
 
 echo "Senha gerada para DB: $DB_PASS"
 
-# 1) Atualizar e instalar pacotes (inclui PHP + extensões recomendadas)
-echo "Instalando dependências (Apache/MariaDB/PHP/Redis)..."
-if [ "$OS" = "debian" ]; then
-  $PKG_UPDATE
-  # instalar pacote php via sury ppa se desejar versão mais nova (omitir se já estiver configurado)
-  # apt install -y software-properties-common && add-apt-repository ppa:ondrej/php -y && apt update -y
+# Helper to run package manager commands (array)
+run_cmd() {
+  "$@"
+}
 
-  $PKG_INSTALL apache2 mariadb-server redis-server curl wget unzip tar \
+# 1) Update & install packages
+echo "Atualizando pacotes..."
+run_cmd "${PKG_UPDATE_CMD[@]}"
+
+# For Debian, ensure apt-get upgrade to apply security fixes
+if [ "$OS" = "debian" ]; then
+  run_cmd "${PKG_UPGRADE_CMD[@]}"
+fi
+
+echo "Instalando pacotes necessários..."
+if [ "$OS" = "debian" ]; then
+  run_cmd "${PKG_INSTALL_CMD[@]}" apache2 mariadb-server "$REDIS_SERVICE" curl wget unzip tar \
     php php-cli php-common php-mysql php-xml php-mbstring php-curl php-gd php-intl php-zip php-bz2 php-ldap php-apcu php-redis
 else
-  $PKG_UPDATE
-  $PKG_INSTALL httpd mariadb-server redis curl wget unzip tar \
+  # RHEL-based
+  run_cmd "${PKG_INSTALL_CMD[@]}" epel-release || true
+  run_cmd "${PKG_INSTALL_CMD[@]}" "$APACHE_SERVICE" mariadb-server "$REDIS_SERVICE" curl wget unzip tar \
     php php-cli php-common php-mysqlnd php-xml php-mbstring php-curl php-gd php-intl php-zip php-bz2 php-ldap php-pecl-apcu php-pecl-redis
 fi
 
 # Enable & start services
-echo "Ativando serviços..."
-if [ "$OS" = "debian" ]; then
-  systemctl enable --now apache2 mariadb redis-server
-else
-  systemctl enable --now httpd mariadb redis
-fi
+echo "Ativando serviços: Apache, MariaDB, Redis..."
+systemctl enable --now "$APACHE_SERVICE" || true
+systemctl enable --now mariadb || true
+systemctl enable --now "$REDIS_SERVICE" || true
 
 # 2) Secure MariaDB minimal (non-interactive)
-echo "Configurando MariaDB (remoção anon, test DB, etc)..."
-# Set root auth if needed: *we assume root access via unix_socket or root without password*
+echo "Aplicando hardening básico do MariaDB..."
 mysql -u root <<SQL
 DELETE FROM mysql.user WHERE User='';
 DROP DATABASE IF EXISTS test;
@@ -81,14 +96,8 @@ DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
 SQL
 
-# Load timezone info so GLPI can use timezone functions (recomendado)
-if command -v mysql_tzinfo_to_sql >/dev/null 2>&1; then
-  echo "Carregando timezone info no MySQL..."
-  mysql_tzinfo_to_sql /usr/share/zoneinfo 2>/dev/null | mysql mysql || true
-fi
-
-# 3) Create DB and user (MariaDB-compatible syntax -> IDENTIFIED BY)
-echo "Criando database e usuário (forçando criação limpa)..."
+# 3) Create DB and user (MariaDB compatible: IDENTIFIED BY)
+echo "Criando database e usuario (compatível MariaDB)..."
 mysql -u root <<SQL
 DROP DATABASE IF EXISTS \`${DB_NAME}\`;
 DROP USER IF EXISTS '${DB_USER}'@'localhost';
@@ -98,9 +107,7 @@ GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';
 FLUSH PRIVILEGES;
 SQL
 
-# Save credentials securely
-CRED_FILE="/root/glpi_db_credentials.txt"
-chmod 600 "$CRED_FILE" 2>/dev/null || true
+# store credentials securely
 cat > "$CRED_FILE" <<EOF
 GLPI DB credentials (generated by installer)
 DB_NAME=${DB_NAME}
@@ -108,150 +115,164 @@ DB_USER=${DB_USER}
 DB_PASS=${DB_PASS}
 EOF
 chmod 600 "$CRED_FILE"
+echo "Credenciais salvas em $CRED_FILE (root only)"
 
-echo "Credenciais salvas em $CRED_FILE"
-
-# 4) Download latest GLPI release from GitHub
-echo "Obtendo última versão do GLPI (GitHub releases)..."
+# 4) Download GLPI latest release
+echo "Recuperando a última release do GLPI do GitHub..."
 GLPI_URL=$(curl -s https://api.github.com/repos/glpi-project/glpi/releases/latest \
   | grep browser_download_url | grep ".tgz" | head -n1 | cut -d '"' -f4)
 
 if [ -z "$GLPI_URL" ]; then
-  echo "Erro: não consegui obter GLPI URL via GitHub API."
+  echo "ERRO: não foi possível obter URL da release do GLPI." >&2
   exit 1
 fi
-
 echo "Baixando: $GLPI_URL"
-wget -O "$TMP_TGZ" "$GLPI_URL" || { echo "Erro ao baixar GLPI"; exit 1; }
+wget -O "$TMP_TGZ" "$GLPI_URL" || { echo "Erro no download do GLPI"; exit 1; }
 
-# 5) Extract and prepare files
-echo "Extraindo GLPI em $GLPI_INSTALL_DIR..."
-rm -rf "$GLPI_INSTALL_DIR"
-mkdir -p "$(dirname "$GLPI_INSTALL_DIR")"
-tar -xzf "$TMP_TGZ" -C /var/www/ || { echo "Erro ao extrair"; exit 1; }
-# Some tarballs extract to a glpi-X.Y.Z folder; normalize
+# 5) Extract & normalize path
+echo "Extraindo GLPI em $GLPI_DIR..."
+rm -rf "$GLPI_DIR"
+mkdir -p /var/www
+tar -xzf "$TMP_TGZ" -C /var/www/ || { echo "Erro ao extrair arquivo"; exit 1; }
+
 if [ -d /var/www/glpi ]; then
   true
 else
-  # move first matching directory starting with glpi- into /var/www/glpi
-  FIRST_DIR=$(ls -1 /var/www | grep -E '^glpi' | head -n1)
-  if [ -n "$FIRST_DIR" ]; then
-    mv "/var/www/$FIRST_DIR" /var/www/glpi
+  # move first glpi-* dir to glpi
+  FIRST=$(ls -1 /var/www | grep -E '^glpi' | head -n1 || true)
+  if [ -n "$FIRST" ]; then
+    mv "/var/www/$FIRST" /var/www/glpi
+  else
+    echo "Erro: não foi encontrada pasta GLPI após extração." >&2
+    exit 1
   fi
 fi
 
-# Ensure web ownership & permissions
-echo "Ajustando permissões (user: $WEB_USER)..."
-chown -R "${WEB_USER}:${WEB_USER}" "$GLPI_INSTALL_DIR"
-find "$GLPI_INSTALL_DIR" -type d -exec chmod 755 {} \;
-find "$GLPI_INSTALL_DIR" -type f -exec chmod 644 {} \;
-# writable dirs
+# 6) Permissions (as GLPI docs)
+echo "Ajustando permissões..."
+chown -R "$WEB_USER":"$WEB_USER" "$GLPI_DIR"
+find "$GLPI_DIR" -type d -exec chmod 755 {} \;
+find "$GLPI_DIR" -type f -exec chmod 644 {} \;
 for d in files config files/_log; do
-  mkdir -p "$GLPI_INSTALL_DIR/$d"
-  chown -R "${WEB_USER}:${WEB_USER}" "$GLPI_INSTALL_DIR/$d"
-  chmod -R 775 "$GLPI_INSTALL_DIR/$d"
+  mkdir -p "$GLPI_DIR/$d"
+  chown -R "$WEB_USER":"$WEB_USER" "$GLPI_DIR/$d"
+  chmod -R 775 "$GLPI_DIR/$d"
 done
 
-# 6) PHP configuration tweaks (php.ini)
-echo "Ajustando php.ini (upload_max_filesize, post_max_size, memory_limit, max_execution_time, timezone)..."
-PHP_INI="$(php --ini | awk -F': ' '/Loaded Configuration/{print $2}')"
-if [ -n "$PHP_INI" ] && [ -f "$PHP_INI" ]; then
-  sed -i "s/^upload_max_filesize.*/upload_max_filesize = 20M/" "$PHP_INI" || true
-  sed -i "s/^post_max_size.*/post_max_size = 20M/" "$PHP_INI" || true
-  sed -i "s/^max_execution_time.*/max_execution_time = 60/" "$PHP_INI" || true
-  sed -i "s/^memory_limit.*/memory_limit = 256M/" "$PHP_INI" || true
-  sed -i "s/^max_input_vars.*/max_input_vars = 5000/" "$PHP_INI" || true
-  sed -i "s@^;*date.timezone.*@date.timezone = \"America/Sao_Paulo\"@" "$PHP_INI" || true
+# 7) PHP tweaks (php.ini)
+echo "Ajustando php.ini (parâmetros mínimos)..."
+PHP_INI_PATH=$(php --ini | awk -F': ' '/Loaded Configuration/{print $2}')
+if [ -n "$PHP_INI_PATH" ] && [ -f "$PHP_INI_PATH" ]; then
+  sed -i "s/^upload_max_filesize.*/upload_max_filesize = 20M/" "$PHP_INI_PATH" || true
+  sed -i "s/^post_max_size.*/post_max_size = 20M/" "$PHP_INI_PATH" || true
+  sed -i "s/^max_execution_time.*/max_execution_time = 120/" "$PHP_INI_PATH" || true
+  sed -i "s/^memory_limit.*/memory_limit = 512M/" "$PHP_INI_PATH" || true
+  sed -i "s/^max_input_vars.*/max_input_vars = 5000/" "$PHP_INI_PATH" || true
+  sed -i "s@^;*date.timezone.*@date.timezone = \"America/Sao_Paulo\"@" "$PHP_INI_PATH" || true
 fi
+# reload apache/php-fpm if needed
+systemctl reload "$APACHE_SERVICE" 2>/dev/null || true
 
-# 7) Apache virtualhost (simple) -> DocumentRoot to GLPI public
-echo "Configurando VirtualHost Apache (DocumentRoot -> ${GLPI_INSTALL_DIR}/public)..."
+# 8) Apache VirtualHost (simple) -> DocumentRoot to GLPI public
+echo "Configurando VirtualHost Apache..."
+HOSTNAME_FQDN=$(hostname -f 2>/dev/null || hostname)
 if [ "$OS" = "debian" ]; then
-  cat > /etc/apache2/sites-available/glpi.conf <<APACHECONF
+  cat > /etc/apache2/sites-available/glpi.conf <<APACHE
 <VirtualHost *:80>
-    ServerName $(hostname -f 2>/dev/null || _)
-    DocumentRoot ${GLPI_INSTALL_DIR}/public
-    <Directory ${GLPI_INSTALL_DIR}/public>
+    ServerName ${HOSTNAME_FQDN}
+    DocumentRoot ${GLPI_DIR}/public
+    <Directory ${GLPI_DIR}/public>
         Require all granted
         AllowOverride All
     </Directory>
     ErrorLog \${APACHE_LOG_DIR}/glpi_error.log
     CustomLog \${APACHE_LOG_DIR}/glpi_access.log combined
 </VirtualHost>
-APACHECONF
+APACHE
   a2enmod rewrite || true
   a2dissite 000-default.conf || true
-  a2ensite glpi.conf
-  systemctl reload apache2
+  a2ensite glpi.conf || true
+  systemctl reload apache2 || true
 else
-  cat > /etc/httpd/conf.d/glpi.conf <<APACHECONF
+  cat > /etc/httpd/conf.d/glpi.conf <<APACHE
 <VirtualHost *:80>
-    ServerName $(hostname -f 2>/dev/null || _)
-    DocumentRoot ${GLPI_INSTALL_DIR}/public
-    <Directory ${GLPI_INSTALL_DIR}/public>
+    ServerName ${HOSTNAME_FQDN}
+    DocumentRoot ${GLPI_DIR}/public
+    <Directory ${GLPI_DIR}/public>
         Require all granted
         AllowOverride All
     </Directory>
     ErrorLog /var/log/httpd/glpi_error.log
     CustomLog /var/log/httpd/glpi_access.log combined
 </VirtualHost>
-APACHECONF
-  systemctl reload httpd
+APACHE
+  systemctl reload httpd || true
 fi
 
-# 8) Install DB via GLPI CLI as web user (recommended)
-echo "Instalando banco via GLPI CLI (executando como $WEB_USER)..."
+# 9) Install DB via GLPI CLI as web user (with fallback)
+echo "Instalando GLPI via CLI (executando como ${WEB_USER})..."
 set +e
-sudo -u "$WEB_USER" php "${GLPI_INSTALL_DIR}/bin/console" db:install \
+sudo -u "${WEB_USER}" php "${GLPI_DIR}/bin/console" db:install \
   --db-host=localhost \
-  --db-name="$DB_NAME" \
-  --db-user="$DB_USER" \
-  --db-password="$DB_PASS" \
+  --db-name="${DB_NAME}" \
+  --db-user="${DB_USER}" \
+  --db-password="${DB_PASS}" \
   --no-interaction
 RC=$?
 set -e
 
 if [ $RC -ne 0 ]; then
-  echo "Aviso: db:install retornou código $RC. Tentando com --allow-superuser..."
-  sudo -u "$WEB_USER" php "${GLPI_INSTALL_DIR}/bin/console" db:install \
+  echo "db:install retornou $RC. Tentando com --allow-superuser..."
+  sudo -u "${WEB_USER}" php "${GLPI_DIR}/bin/console" db:install \
     --db-host=localhost \
-    --db-name="$DB_NAME" \
-    --db-user="$DB_USER" \
-    --db-password="$DB_PASS" \
+    --db-name="${DB_NAME}" \
+    --db-user="${DB_USER}" \
+    --db-password="${DB_PASS}" \
     --allow-superuser \
     --no-interaction
 fi
 
-# 9) Configure Redis (cache/session) via console if supported
-echo "Configurando Redis (cache) no GLPI (se disponível)..."
-if sudo -u "$WEB_USER" php "${GLPI_INSTALL_DIR}/bin/console" config:list >/dev/null 2>&1; then
-  sudo -u "$WEB_USER" php "${GLPI_INSTALL_DIR}/bin/console" config:set cache_handler redis || true
-  sudo -u "$WEB_USER" php "${GLPI_INSTALL_DIR}/bin/console" config:set redis_host 127.0.0.1 || true
+# 10) Configure Redis (local_define.php + console fallback)
+echo "Configurando Redis no GLPI (local_define.php)..."
+LOCAL_DEFINE="${GLPI_DIR}/config/local_define.php"
+cat > "$LOCAL_DEFINE" <<PHPDEF
+<?php
+define('GLPI_CACHE_TYPE', 'redis');
+define('GLPI_REDIS_HOST', '127.0.0.1');
+define('GLPI_REDIS_PORT', 6379);
+define('GLPI_REDIS_DB', 0);
+PHPDEF
+chown "$WEB_USER":"$WEB_USER" "$LOCAL_DEFINE"
+chmod 644 "$LOCAL_DEFINE"
+
+# Try console config as well
+if sudo -u "${WEB_USER}" php "${GLPI_DIR}/bin/console" config:list >/dev/null 2>&1; then
+  sudo -u "${WEB_USER}" php "${GLPI_DIR}/bin/console" config:set cache_handler redis || true
+  sudo -u "${WEB_USER}" php "${GLPI_DIR}/bin/console" config:set redis_host 127.0.0.1 || true
 fi
 
-# 10) Cron setup (systemd timer preferred, mas manter compatibilidade com cron.d)
-echo "Configurando cron do GLPI (cron.d)..."
+# 11) Cron: cron.d + systemd timer
+echo "Configurando cron (cron.d + systemd timer)..."
 CRON_FILE="/etc/cron.d/glpi"
 cat > "$CRON_FILE" <<CRON
-*/5 * * * * ${WEB_USER} php ${GLPI_INSTALL_DIR}/bin/console glpi:cron >> ${GLPI_INSTALL_DIR}/files/_log/cron.log 2>&1
+*/5 * * * * ${WEB_USER} php ${GLPI_DIR}/bin/console glpi:cron >> ${GLPI_DIR}/files/_log/cron.log 2>&1
 CRON
 chmod 644 "$CRON_FILE"
 
-# Optionally create systemd timer (safer). We'll create both: cron.d and systemd timer.
-TIMER_SERVICE="/etc/systemd/system/glpi-cron.service"
-TIMER_TIMER="/etc/systemd/system/glpi-cron.timer"
-cat > "$TIMER_SERVICE" <<SERV
+TIMER_SVC="/etc/systemd/system/glpi-cron.service"
+TIMER_TM="/etc/systemd/system/glpi-cron.timer"
+cat > "$TIMER_SVC" <<SVC
 [Unit]
-Description=GLPI Cron Service
+Description=GLPI Cron Job
 After=network.target
 
 [Service]
 Type=oneshot
 User=${WEB_USER}
-ExecStart=/usr/bin/php ${GLPI_INSTALL_DIR}/bin/console glpi:cron
-SERV
+ExecStart=/usr/bin/php ${GLPI_DIR}/bin/console glpi:cron
+SVC
 
-cat > "$TIMER_TIMER" <<TIMER
+cat > "$TIMER_TM" <<TIMER
 [Unit]
 Description=Run GLPI cron every 5 minutes
 
@@ -267,17 +288,17 @@ TIMER
 systemctl daemon-reload || true
 systemctl enable --now glpi-cron.timer || true
 
-# 11) Final message
-IP=$(hostname -I | awk '{print $1}')
+# Final
+IP=$(hostname -I | awk '{print $1}' | head -n1 || echo "localhost")
 echo ""
-echo "=========================================="
+echo "=============================================="
 echo "  INSTALAÇÃO CONCLUÍDA"
-echo "  Acesse: http://${IP}"
+echo "  Acesse: http://${IP}/ (GLPI em ${GLPI_DIR}/public)"
 echo ""
-echo "  GLPI Path: ${GLPI_INSTALL_DIR}"
-echo "  DB: ${DB_NAME}"
-echo "  DB USER: ${DB_USER}"
-echo "  DB PASS: ${DB_PASS}"
+echo "  DB_NAME: ${DB_NAME}"
+echo "  DB_USER: ${DB_USER}"
+echo "  DB_PASS: ${DB_PASS}"
 echo ""
-echo "Verifique logs: $LOG"
-echo "=========================================="
+echo "Credenciais salvas em: ${CRED_FILE}"
+echo "Logs: ${LOG}"
+echo "=============================================="
