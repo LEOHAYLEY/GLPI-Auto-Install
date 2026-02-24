@@ -1,32 +1,30 @@
 #!/bin/bash
-set -e
 
 LOGFILE="/var/log/glpi_install.log"
-exec > >(tee -i $LOGFILE)
-exec 2>&1
 
 echo "=============================================="
 echo "        GLPI Professional Installer"
 echo "=============================================="
+echo "Log: $LOGFILE"
+echo "=============================================="
 
+# Verifica root
 if [ "$EUID" -ne 0 ]; then
   echo "Execute como root."
   exit 1
 fi
 
-# Detect OS
+# Detecta sistema operacional
 if [ -f /etc/debian_version ]; then
     OS="debian"
     APACHE="apache2"
     APACHE_USER="www-data"
-    REDIS_CONF="/etc/redis/redis.conf"
     PKG_UPDATE="apt update -y"
     PKG_INSTALL="apt install -y"
 elif [ -f /etc/redhat-release ]; then
     OS="rhel"
     APACHE="httpd"
     APACHE_USER="apache"
-    REDIS_CONF="/etc/redis.conf"
     PKG_UPDATE="dnf update -y"
     PKG_INSTALL="dnf install -y"
 else
@@ -37,112 +35,59 @@ fi
 echo "Sistema detectado: $OS"
 sleep 2
 
-$PKG_UPDATE
+# Atualiza pacotes
+echo "Atualizando sistema..."
+eval $PKG_UPDATE || { echo "Erro ao atualizar pacotes"; exit 1; }
 
-# Get latest GLPI
+# Instala dependências básicas
+echo "Instalando dependências..."
+if [ "$OS" = "debian" ]; then
+    eval $PKG_INSTALL curl wget unzip apache2 mariadb-server php php-cli php-common php-mysql php-gd php-intl php-mbstring php-bcmath php-xml php-curl php-zip php-ldap redis-server
+else
+    eval $PKG_INSTALL curl wget unzip httpd mariadb-server php php-cli php-common php-mysqlnd php-gd php-intl php-mbstring php-bcmath php-xml php-curl php-zip php-ldap redis
+fi
+
+if [ $? -ne 0 ]; then
+    echo "Erro ao instalar dependências."
+    exit 1
+fi
+
+# Inicia serviços
+echo "Iniciando serviços..."
+systemctl enable $APACHE --now
+systemctl enable mariadb --now
+
+if [ "$OS" = "debian" ]; then
+    systemctl enable redis-server --now
+else
+    systemctl enable redis --now
+fi
+
+# Obtém última versão do GLPI
 echo "Obtendo última versão do GLPI..."
 GLPI_URL=$(curl -s https://api.github.com/repos/glpi-project/glpi/releases/latest \
 | grep browser_download_url \
 | grep ".tgz" \
 | cut -d '"' -f 4)
-echo "GLPI URL: $GLPI_URL"
 
-# Instalar PHP (8.2)
-PHP_VERSION="8.2"
-
-echo "Instalando PHP $PHP_VERSION"
-
-if [ "$OS" = "debian" ]; then
-    $PKG_INSTALL software-properties-common
-    add-apt-repository ppa:ondrej/php -y
-    apt update -y
-
-    $PKG_INSTALL $APACHE mariadb-server redis-server \
-    php$PHP_VERSION php$PHP_VERSION-{mysql,curl,gd,intl,xml,mbstring,bz2,zip,ldap,apcu,imap,opcache,cli,redis} \
-    unzip wget curl tar openssl
-
-elif [ "$OS" = "rhel" ]; then
-    $PKG_INSTALL epel-release
-    $PKG_INSTALL https://rpms.remirepo.net/enterprise/remi-release-$(rpm -E %rhel).rpm
-    dnf module enable php:remi-$PHP_VERSION -y
-
-    $PKG_INSTALL $APACHE mariadb-server redis \
-    php php-mysqlnd php-curl php-gd php-intl php-xml \
-    php-mbstring php-bz2 php-zip php-ldap php-opcache \
-    php-cli php-pecl-redis unzip wget curl tar openssl
+if [ -z "$GLPI_URL" ]; then
+    echo "Erro ao obter URL do GLPI."
+    exit 1
 fi
 
-systemctl enable mariadb
-systemctl start mariadb
+echo "Baixando GLPI: $GLPI_URL"
+wget -O /tmp/glpi.tgz $GLPI_URL || { echo "Erro no download do GLPI"; exit 1; }
 
-systemctl enable $APACHE
-systemctl start $APACHE
+# Instala GLPI
+echo "Extraindo arquivos..."
+tar -xzf /tmp/glpi.tgz -C /var/www/ || { echo "Erro ao extrair"; exit 1; }
 
-systemctl enable redis
-systemctl start redis
-
-# Redis config
-echo "Configurando Redis..."
-sed -i "s/^# maxmemory .*/maxmemory 256mb/" $REDIS_CONF || true
-sed -i "s/^# maxmemory-policy .*/maxmemory-policy allkeys-lru/" $REDIS_CONF || true
-systemctl restart redis
-
-# MariaDB secure install
-echo "Configurando MariaDB seguro..."
-MYSQL_ROOT_PASS=$(openssl rand -base64 16)
-GLPI_DB_PASS=$(openssl rand -base64 16)
-
-mysql --user=root <<EOF
-ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASS';
-DELETE FROM mysql.user WHERE User='';
-DROP DATABASE IF EXISTS test;
-DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
-FLUSH PRIVILEGES;
-EOF
-
-echo "Senha root MariaDB: $MYSQL_ROOT_PASS" > /root/glpi_db_credentials.txt
-
-# Create GLPI database
-mysql -uroot -p"$MYSQL_ROOT_PASS" <<EOF
-CREATE DATABASE glpi CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-CREATE USER 'glpi'@'localhost' IDENTIFIED BY '$GLPI_DB_PASS';
-GRANT ALL PRIVILEGES ON glpi.* TO 'glpi'@'localhost';
-FLUSH PRIVILEGES;
-EOF
-
-echo "Usuário GLPI: glpi" >> /root/glpi_db_credentials.txt
-echo "Senha GLPI: $GLPI_DB_PASS" >> /root/glpi_db_credentials.txt
-
-# Download GLPI
-echo "Baixando GLPI..."
-wget -O /tmp/glpi.tgz "$GLPI_URL"
-tar -xzf /tmp/glpi.tgz -C /var/www/
-mv /var/www/glpi* /var/www/glpi
-
-# Permissions
-echo "Configurando permissões..."
 chown -R $APACHE_USER:$APACHE_USER /var/www/glpi
-find /var/www/glpi -type d -exec chmod 755 {} \;
-find /var/www/glpi -type f -exec chmod 644 {} \;
-chmod -R 775 /var/www/glpi/files
-chmod -R 775 /var/www/glpi/config
+chmod -R 755 /var/www/glpi
 
-# Redis in GLPI
-echo "Configurando Redis no GLPI..."
-cat <<EOF >> /var/www/glpi/config/local_define.php
-<?php
-define('GLPI_CACHE_TYPE', 'redis');
-define('GLPI_CACHE_REDIS_SERVER', '127.0.0.1');
-define('GLPI_CACHE_REDIS_PORT', 6379);
-define('GLPI_CACHE_REDIS_DB', 0);
-EOF
-
-chown $APACHE_USER:$APACHE_USER /var/www/glpi/config/local_define.php
-chmod 644 /var/www/glpi/config/local_define.php
-
-# Apache config
+# Configura Apache
 if [ "$OS" = "debian" ]; then
-cat <<EOF > /etc/apache2/sites-available/glpi.conf
+cat > /etc/apache2/sites-available/glpi.conf <<EOF
 <VirtualHost *:80>
     DocumentRoot /var/www/glpi/public
     <Directory /var/www/glpi/public>
@@ -151,53 +96,25 @@ cat <<EOF > /etc/apache2/sites-available/glpi.conf
     </Directory>
 </VirtualHost>
 EOF
+
 a2enmod rewrite
 a2ensite glpi.conf
 systemctl reload apache2
-
 else
-cat <<EOF > /etc/httpd/conf.d/glpi.conf
+cat > /etc/httpd/conf.d/glpi.conf <<EOF
 <VirtualHost *:80>
     DocumentRoot /var/www/glpi/public
     <Directory /var/www/glpi/public>
-        AllowOverride All
         Require all granted
+        AllowOverride All
     </Directory>
 </VirtualHost>
 EOF
-systemctl restart httpd
+
+systemctl reload httpd
 fi
 
-# Cron via systemd
-echo "Configurando cron automático do GLPI..."
-cat <<EOF > /etc/systemd/system/glpi-cron.service
-[Unit]
-Description=GLPI Cron Service
-[Service]
-Type=oneshot
-User=$APACHE_USER
-Group=$APACHE_USER
-ExecStart=/usr/bin/php /var/www/glpi/bin/console glpi:cron
-EOF
-
-cat <<EOF > /etc/systemd/system/glpi-cron.timer
-[Unit]
-Description=Run GLPI cron every 5 minutes
-[Timer]
-OnBootSec=5min
-OnUnitActiveSec=5min
-Unit=glpi-cron.service
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable glpi-cron.timer
-systemctl start glpi-cron.timer
-
-echo ""
 echo "=============================================="
-echo "GLPI instalado com sucesso!"
-echo "Credenciais em /root/glpi_db_credentials.txt"
-echo "Acesse: http://IP_DO_SERVIDOR"
+echo "Instalação concluída."
+echo "Acesse: http://SEU_IP"
 echo "=============================================="
